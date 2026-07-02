@@ -227,8 +227,33 @@ def main() -> int:
         print(f"  Card keys: {card_key_ids or 'none found'}")
         exit_code = 1
 
-    # ── 4. Touch policy ──────────────────────────────────────────────────────
-    print(header("4. Touch (UIF) policy"))
+    # ── 4. SSH key via YubiKey ───────────────────────────────────────────────
+    # Must run BEFORE the ykman check: ykman takes exclusive card access and
+    # knocks scdaemon off the card, which empties the agent's card-backed keys
+    # until the next gpg --card-status.
+    print(header("4. SSH key loaded from YubiKey"))
+    ssh_status, ssh_keys = check_ssh_yubikey()
+
+    if ssh_status == "found":
+        for k in ssh_keys:
+            print(ok(f"YubiKey SSH key loaded: {k}"))
+    elif ssh_status == "no_agent":
+        print(fail("SSH agent is not running or not reachable"))
+        print("  To use gpg-agent as your SSH agent:")
+        print("    1. Add to ~/.gnupg/gpg-agent.conf:  enable-ssh-support")
+        print("    2. Restart the agent:               gpgconf --kill gpg-agent && gpgconf --launch gpg-agent")
+        print("    3. Point SSH at the gpg-agent socket (add to ~/.zshrc / ~/.bashrc):")
+        print("         export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket)")
+        print("    4. Re-open your terminal (or source the file), then re-run this script.")
+        exit_code = 1
+    else:
+        print(warn("No YubiKey-backed SSH key found in ssh-agent (no cardno: comment)"))
+        print("  Ensure the YubiKey auth subkey is known to gpg-agent:")
+        print("    gpg --card-status   # imports the auth subkey stub if not yet present")
+        exit_code = 1
+
+    # ── 5. Touch policy ──────────────────────────────────────────────────────
+    print(header("5. Touch (UIF) policy"))
 
     ykman_ok, ykman_out = get_ykman_openpgp_info()
 
@@ -254,28 +279,6 @@ def main() -> int:
                     print(fail(f"{label:15s}: touch NOT required ({policy})"))
                     print(f"    Fix: ykman openpgp keys set-touch {slot} on")
                     exit_code = 1
-
-    # ── 5. SSH key via YubiKey ───────────────────────────────────────────────
-    print(header("5. SSH key loaded from YubiKey"))
-    ssh_status, ssh_keys = check_ssh_yubikey()
-
-    if ssh_status == "found":
-        for k in ssh_keys:
-            print(ok(f"YubiKey SSH key loaded: {k}"))
-    elif ssh_status == "no_agent":
-        print(fail("SSH agent is not running or not reachable"))
-        print("  To use gpg-agent as your SSH agent:")
-        print("    1. Add to ~/.gnupg/gpg-agent.conf:  enable-ssh-support")
-        print("    2. Restart the agent:               gpgconf --kill gpg-agent && gpgconf --launch gpg-agent")
-        print("    3. Point SSH at the gpg-agent socket (add to ~/.zshrc / ~/.bashrc):")
-        print("         export SSH_AUTH_SOCK=$(gpgconf --list-dirs agent-ssh-socket)")
-        print("    4. Re-open your terminal (or source the file), then re-run this script.")
-        exit_code = 1
-    else:
-        print(warn("No YubiKey-backed SSH key found in ssh-agent (no cardno: comment)"))
-        print("  Ensure the YubiKey auth subkey is known to gpg-agent:")
-        print("    gpg --card-status   # imports the auth subkey stub if not yet present")
-        exit_code = 1
 
     # ── Summary ──────────────────────────────────────────────────────────────
     print(header("Summary"))

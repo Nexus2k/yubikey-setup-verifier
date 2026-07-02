@@ -7,8 +7,8 @@ A command-line tool that verifies your YubiKey is correctly configured for GPG c
 1. **Git commit signing** — `commit.gpgsign = true` and `user.signingkey` are set in `~/.gitconfig`
 2. **YubiKey card status** — a YubiKey is inserted and readable via `gpg --card-status`
 3. **GPG key / YubiKey match** — the signing key in git config matches a key on the inserted YubiKey
-4. **Touch (UIF) policy** — signing, encryption, and authentication slots all require a physical touch
-5. **SSH key loaded** — a YubiKey-backed key (with a `cardno:` comment) is loaded in the SSH agent
+4. **SSH key loaded** — a YubiKey-backed key (with a `cardno:` comment) is loaded in the SSH agent
+5. **Touch (UIF) policy** — signing, encryption, and authentication slots all require a physical touch
 
 ## Requirements
 
@@ -47,13 +47,13 @@ Exit code `0` means all checks passed. Any non-zero exit code indicates one or m
 3. GPG key / YubiKey match
 ✓ Git signing key ABC1234567890DEF matches YubiKey sign slot
 
-4. Touch (UIF) policy
+4. SSH key loaded from YubiKey
+✓ YubiKey SSH key loaded: cardno:000123456789
+
+5. Touch (UIF) policy
 ✓ Signing        : touch required  (on)
 ✓ Encryption     : touch required  (on)
 ✓ Authentication : touch required  (on)
-
-5. SSH key loaded from YubiKey
-✓ YubiKey SSH key loaded: cardno:000123456789
 
 Summary
 ✓ All checks passed
