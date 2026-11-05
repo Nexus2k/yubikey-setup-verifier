@@ -31,6 +31,31 @@ python3 verify.py
 
 Exit code `0` means all checks passed. Any non-zero exit code indicates one or more failures — review the output for details and suggested fixes.
 
+Colours are only used on an interactive terminal (and never with `NO_COLOR` set), so `python3 verify.py | pbcopy` gives clean text for a pull request.
+
+### Exporting for private signed-commits enrollment
+
+```bash
+python3 verify.py --export                       # GitHub login detected via `gh`
+python3 verify.py --export <github-login> --keys-dir ../ml-signed-commits/keys
+```
+
+After all checks pass, `--export`:
+
+- writes the public key (never the secret key) to `<keys-dir>/<github-login>.asc`
+- prints a `keys/index.yaml` `people:` stanza between `----8<----` markers, with the primary fingerprint, the YubiKey's signing fingerprint, and allowed emails (`git user.email`, your GitHub noreply address if `gh` is logged in as that user, plus any `--email`)
+
+The `verified:` block is left empty on purpose. The reviewer fills it in after the out-of-band fingerprint check; until then the whitelist validator rejects the entry.
+
+| Option | Purpose |
+|---|---|
+| `--keys-dir DIR` | Where to write the `.asc` (default: current directory) |
+| `--name NAME` | Name for the stanza (default: `git user.name`) |
+| `--email ADDR` | Extra allowed author email, repeatable |
+| `--force` | Overwrite an existing `.asc` with different content |
+
+Export is skipped if any check fails.
+
 ## Example output
 
 ```

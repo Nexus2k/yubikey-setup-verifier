@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""Verify YubiKey GPG configuration against global git config."""
+"""Verify YubiKey GPG configuration against global git config.
 
+With --export, also writes <github-login>.asc and prints the keys/index.yaml
+`people:` stanza for enrollment in ml-signed-commits.
+"""
+
+import argparse
+import json
+import os
 import re
 import subprocess
 import sys
+from datetime import date
+from pathlib import Path
 from typing import Optional
 
 
-RESET = "\033[0m"
-RED = "\033[31m"
-GREEN = "\033[32m"
-YELLOW = "\033[33m"
-BOLD = "\033[1m"
+# Colours only on an interactive terminal, so piped / redirected output is
+# clean to paste into a pull request. NO_COLOR (https://no-color.org) wins.
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+RESET = "\033[0m" if _COLOR else ""
+RED = "\033[31m" if _COLOR else ""
+GREEN = "\033[32m" if _COLOR else ""
+YELLOW = "\033[33m" if _COLOR else ""
+BOLD = "\033[1m" if _COLOR else ""
+
+FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
+GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$")
 
 
 def ok(msg: str) -> str:
@@ -58,6 +73,11 @@ def parse_card_key_ids(card_output: str) -> dict[str, str]:
     Extract the fingerprints from card-status output and return the last 16 hex
     chars (long key ID) for each slot: sign, encrypt, auth.
     """
+    return {slot: fp[-16:] for slot, fp in parse_card_fingerprints(card_output).items()}
+
+
+def parse_card_fingerprints(card_output: str) -> dict[str, str]:
+    """Return the full 40-hex fingerprint for each card slot: sign, encrypt, auth."""
     keys: dict[str, str] = {}
     # Card-status prints fingerprints like:
     #   Signature key ....: AABB CCDD ...
@@ -74,8 +94,8 @@ def parse_card_key_ids(card_output: str) -> dict[str, str]:
         m = re.search(pattern, card_output, re.IGNORECASE)
         if m:
             fp = m.group(1).replace(" ", "").upper()
-            if len(fp) >= 16:
-                keys[slot] = fp[-16:]  # long key ID
+            if FINGERPRINT_RE.fullmatch(fp):
+                keys[slot] = fp
     return keys
 
 
@@ -173,7 +193,200 @@ def check_ssh_yubikey() -> tuple:
     return ("found" if matching else "no_yubikey"), matching
 
 
-def main() -> int:
+# ── Export for ml-signed-commits ─────────────────────────────────────────────
+
+
+def lookup_primary_key(signing_fpr: str) -> Optional[dict]:
+    """
+    Find the primary key that owns `signing_fpr` (a subkey or the primary itself).
+    Returns {primary, validity, uids, signers} or None.
+    """
+    code, out, _ = run(["gpg", "--with-colons", "--fixed-list-mode",
+                        "--with-subkey-fingerprint", "--list-keys", signing_fpr])
+    if code != 0:
+        return None
+    current: Optional[dict] = None
+    pending: Optional[tuple] = None   # (record type, validity, capabilities)
+    found: Optional[dict] = None
+    for line in out.splitlines():
+        f = line.split(":")
+        rec = f[0]
+        if rec == "pub":
+            if current and found is None and signing_fpr in current["all"]:
+                found = current
+            current = {"primary": None, "validity": f[1], "uids": [], "signers": [], "all": set()}
+            pending = ("pub", f[1], f[11] if len(f) > 11 else "")
+        elif rec == "sub":
+            pending = ("sub", f[1], f[11] if len(f) > 11 else "")
+        elif rec == "fpr" and current is not None and pending is not None:
+            fpr = f[9].upper()
+            kind, validity, caps = pending
+            if kind == "pub":
+                current["primary"] = fpr
+            current["all"].add(fpr)
+            if "s" in caps and validity not in ("e", "r"):
+                current["signers"].append(fpr)
+            pending = None
+        elif rec == "uid" and current is not None and f[1] not in ("r", "e"):
+            current["uids"].append(f[9])
+    if current and found is None and signing_fpr in current["all"]:
+        found = current
+    return found
+
+
+def uid_name(uid: str) -> str:
+    """'Jane Doe (comment) <jane@x>' -> 'Jane Doe'"""
+    return re.sub(r"\s*(\(.*?\))?\s*<[^>]*>\s*$", "", uid).strip()
+
+
+def github_identity() -> tuple:
+    """Return (login, noreply_email) from the gh CLI, or (None, None)."""
+    try:
+        code, out, _ = run(["gh", "api", "user", "--jq", '"\\(.login) \\(.id)"'])
+    except FileNotFoundError:
+        return None, None
+    parts = out.split()
+    if code != 0 or len(parts) != 2:
+        return None, None
+    login, uid = parts
+    return login, f"{uid}+{login}@users.noreply.github.com"
+
+
+def yaml_scalar(value: str) -> str:
+    """Emit a YAML scalar, double-quoting anything that is not obviously plain."""
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 .@+_\-]*", value) and not value.endswith(" "):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def people_stanza(login: str, name: str, key_path: str, primary: str,
+                  signers: list, emails: list) -> str:
+    lines = [
+        f"  - github: {yaml_scalar(login)}",
+        f"    name: {yaml_scalar(name)}",
+        f"    key: {key_path}",
+        "    fingerprints:",
+        f"      - {primary}",
+        "    signing_fingerprints:",
+        *[f"      - {s}" for s in signers],
+        "    emails:",
+        *[f"      - {yaml_scalar(e)}" for e in emails],
+        "    status: active",
+        "    verified:",
+        "      # Filled in by the reviewer after the out-of-band fingerprint check.",
+        "      # Left empty on purpose: validate_whitelist.py rejects this until then.",
+        "      by: \"\"",
+        f"      date: \"\"  # e.g. {date.today().isoformat()}",
+        "      method: \"\"  # e.g. fingerprint read back over a video call",
+    ]
+    return "\n".join(lines)
+
+
+def export_enrollment(args, card_fprs: dict) -> int:
+    """Write <login>.asc and print the index.yaml stanza. Returns an exit code."""
+    print(header("Export for ml-signed-commits"))
+
+    signing_fpr = card_fprs.get("sign")
+    if not signing_fpr:
+        print(fail("No full signing-slot fingerprint found in gpg --card-status"))
+        return 1
+
+    key = lookup_primary_key(signing_fpr)
+    if key is None or not key["primary"]:
+        print(fail(f"Public key for card signing key {signing_fpr} is not in your keyring"))
+        print("  Import it (e.g. gpg --card-edit → fetch, or gpg --import <pubkey>) and re-run.")
+        return 1
+    primary = key["primary"]
+    if key["validity"] in ("e", "r"):
+        state = "expired" if key["validity"] == "e" else "revoked"
+        print(fail(f"Primary key {primary} is {state} — CI will reject it. Renew or rotate first."))
+        return 1
+    if signing_fpr not in key["signers"]:
+        print(fail(f"Card signing key {signing_fpr} is expired, revoked, or not signing-capable"))
+        return 1
+
+    gh_login, gh_noreply = github_identity()
+    login = args.export if args.export != "auto" else gh_login
+    if not login:
+        print(fail("Could not determine your GitHub login. Pass it: --export <github-login>"))
+        return 1
+    if not GITHUB_LOGIN_RE.fullmatch(login):
+        print(fail(f"'{login}' is not a valid GitHub login"))
+        return 1
+
+    name = (args.name or get_git_config("user.name")
+            or next((uid_name(u) for u in key["uids"] if uid_name(u)), ""))
+    if not name:
+        print(fail("Could not determine your name. Pass it: --name 'Your Name'"))
+        return 1
+
+    emails: list = []
+    candidates = [get_git_config("user.email"), *(args.email or [])]
+    if gh_noreply and gh_login and gh_login.lower() == login.lower():
+        candidates.append(gh_noreply)
+    for e in candidates:
+        if e and e.strip().lower() not in emails:
+            emails.append(e.strip().lower())
+    if not emails:
+        print(fail("No author email found. Set git user.email or pass --email"))
+        return 1
+
+    # Public export only. Never the secret key.
+    code, armored, err = run(["gpg", "--armor", "--export-options", "export-clean",
+                              "--export", primary])
+    if code != 0 or "BEGIN PGP PUBLIC KEY BLOCK" not in armored:
+        print(fail(f"gpg --export {primary} failed: {err.strip()}"))
+        return 1
+    if "PRIVATE KEY BLOCK" in armored:
+        print(fail("Export unexpectedly contains private key material — aborting"))
+        return 1
+
+    out_dir = Path(args.keys_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    asc_path = out_dir / f"{login}.asc"
+    if asc_path.exists() and asc_path.read_text() != armored and not args.force:
+        print(fail(f"{asc_path} already exists with different content (use --force, "
+                   "or a distinct name for rotation)"))
+        return 1
+    asc_path.write_text(armored)
+    print(ok(f"Wrote public key: {asc_path}"))
+
+    print(f"  Primary fingerprint : {primary}")
+    print(f"  Signing fingerprint : {signing_fpr}")
+    if signing_fpr == primary:
+        print("  (the primary key itself is the signing key)")
+    print(f"  Emails              : {', '.join(emails)}")
+    if not (gh_noreply and gh_login and gh_login.lower() == login.lower()):
+        print(warn("GitHub noreply address not added (gh CLI unavailable or different login)."))
+        print("  Add it with --email if you commit via that address:")
+        print("    gh api user --jq '\"\\(.id)+\\(.login)@users.noreply.github.com\"'")
+
+    stanza = people_stanza(login, name, f"keys/{login}.asc", primary, [signing_fpr], emails)
+    print("\nAppend to keys/index.yaml under `people:`")
+    print("----8<----")
+    print(stanza)
+    print("----8<----")
+    return 0
+
+
+def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Verify YubiKey GPG commit-signing setup.")
+    p.add_argument("--export", nargs="?", const="auto", metavar="GITHUB_LOGIN",
+                   help="after all checks pass, write <GITHUB_LOGIN>.asc and print the "
+                        "ml-signed-commits keys/index.yaml stanza (login auto-detected via gh "
+                        "if omitted)")
+    p.add_argument("--keys-dir", default=".", metavar="DIR",
+                   help="where to write the .asc file (default: current directory; "
+                        "point at ml-signed-commits/keys to drop it in place)")
+    p.add_argument("--name", help="name for the stanza (default: git user.name)")
+    p.add_argument("--email", action="append", metavar="ADDR",
+                   help="extra allowed author email (repeatable); git user.email is always included")
+    p.add_argument("--force", action="store_true", help="overwrite an existing, different .asc")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = parse_args(argv)
     exit_code = 0
 
     print(header("=== YubiKey GPG Commit-Signing Verifier ==="))
@@ -209,6 +422,7 @@ def main() -> int:
 
     print(ok("YubiKey detected via gpg --card-status"))
 
+    card_fprs = parse_card_fingerprints(card_output)
     card_key_ids = parse_card_key_ids(card_output)
     if not card_key_ids:
         print(warn("Could not parse key fingerprints from card-status output"))
@@ -283,6 +497,14 @@ def main() -> int:
         print(ok("All checks passed"))
     else:
         print(fail("One or more checks failed — review output above"))
+
+    # ── Optional export ──────────────────────────────────────────────────────
+    if args.export:
+        if exit_code != 0:
+            print(header("Export for ml-signed-commits"))
+            print(fail("Skipped: all checks must pass before enrolling (see docs/ENROLLMENT.md)"))
+        else:
+            exit_code = export_enrollment(args, card_fprs)
 
     return exit_code
 
